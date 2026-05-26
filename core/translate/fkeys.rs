@@ -238,13 +238,14 @@ where
 
 /// Iterate a table and call `on_match` when all child columns equal the key at `parent_key_start`.
 /// Skips rows where any FK column is NULL. If `self_exclude_rowid` is Some, the row with that rowid is skipped.
-fn table_scan_match_any<F>(
+pub(crate) fn table_scan_match_any<F>(
     program: &mut ProgramBuilder,
     child_tbl: &Arc<BTreeTable>,
     child_cols: &[String],
     parent_key_start: usize,
     self_exclude_rowid: Option<usize>,
     database_id: usize,
+    resolver: &Resolver,
     mut on_match: F,
 ) -> Result<()>
 where
@@ -252,6 +253,13 @@ where
 {
     let ccur = open_read_table(program, child_tbl, database_id);
     let done = program.allocate_label();
+    // `=` comparison semantics: if any parent-key component is NULL, no child row can match.
+    for i in 0..child_cols.len() {
+        program.emit_insn(Insn::IsNull {
+            reg: parent_key_start + i,
+            target_pc: done,
+        });
+    }
     program.emit_insn(Insn::Rewind {
         cursor_id: ccur,
         pc_if_empty: done,
@@ -261,18 +269,55 @@ where
     program.preassign_label_to_next_insn(loop_top);
     let next_row = program.allocate_label();
 
-    // Compare each FK column to parent key component.
-    for (i, cname) in child_cols.iter().enumerate() {
-        let (pos, _) = child_tbl
-            .get_column(cname)
-            .ok_or_else(|| LimboError::InternalError(format!("child col {cname} missing")))?;
-        let tmp = program.alloc_register();
-        program.emit_insn(Insn::Column {
+    let fk_col_defs: Vec<_> = child_cols
+        .iter()
+        .map(|cname| {
+            child_tbl
+                .get_column(cname)
+                .ok_or_else(|| LimboError::InternalError(format!("child col {cname} missing")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let some_fk_cols_are_virtual = fk_col_defs
+        .iter()
+        .any(|(_, col)| col.is_virtual_generated());
+    let virtual_fk_ctx = if some_fk_cols_are_virtual {
+        let child_rowid_reg = program.alloc_register();
+        program.emit_insn(Insn::RowId {
             cursor_id: ccur,
-            column: pos,
-            dest: tmp,
-            default: None,
+            dest: child_rowid_reg,
         });
+        Some((
+            emit_columns_and_dependencies(
+                program,
+                child_tbl,
+                ccur,
+                child_rowid_reg,
+                fk_col_defs.iter().map(|(pos, _)| *pos),
+                resolver,
+            )?,
+            child_rowid_reg,
+        ))
+    } else {
+        None
+    };
+
+    // Compare each FK column to parent key component.
+    for (i, (pos, col)) in fk_col_defs.iter().enumerate() {
+        let tmp = program.alloc_register();
+        if let Some((ctx, _)) = &virtual_fk_ctx {
+            emit_table_column_for_dml(
+                program,
+                ccur,
+                ctx.clone(),
+                col,
+                *pos,
+                tmp,
+                resolver,
+                child_tbl,
+            )?;
+        } else {
+            program.emit_column_or_rowid(ccur, *pos, tmp);
+        }
         program.emit_insn(Insn::IsNull {
             reg: tmp,
             target_pc: next_row,
@@ -283,7 +328,7 @@ where
             lhs: tmp,
             rhs: parent_key_start + i,
             target_pc: cont,
-            flags: CmpInsFlags::default().jump_if_null(),
+            flags: CmpInsFlags::default(),
             collation: Some(CollationSeq::Binary),
         });
         program.emit_insn(Insn::Goto {
@@ -292,14 +337,19 @@ where
         program.preassign_label_to_next_insn(cont);
     }
 
-    //self-reference exclusion on rowid
+    // self-reference exclusion on rowid
     if let Some(parent_rowid) = self_exclude_rowid {
-        let child_rowid = program.alloc_register();
+        let child_rowid = if let Some((_, rowid_reg)) = &virtual_fk_ctx {
+            *rowid_reg
+        } else {
+            let child_rowid = program.alloc_register();
+            program.emit_insn(Insn::RowId {
+                cursor_id: ccur,
+                dest: child_rowid,
+            });
+            child_rowid
+        };
         let skip = program.allocate_label();
-        program.emit_insn(Insn::RowId {
-            cursor_id: ccur,
-            dest: child_rowid,
-        });
         program.emit_insn(Insn::Eq {
             lhs: child_rowid,
             rhs: parent_rowid,
@@ -663,11 +713,21 @@ fn emit_fk_parent_key_probe(
     });
 
     if let Some(ix) = idx {
+        let skip_probe = program.allocate_label();
+        for i in 0..n_cols {
+            program.emit_insn(Insn::IsNull {
+                reg: parent_key_start + i,
+                target_pc: skip_probe,
+            });
+        }
+
         let icur = open_read_index(program, ix, database_id);
         let probe = copy_with_affinity(program, parent_key_start, n_cols, ix, child_tbl);
 
         // FOUND => on_match; NOT FOUND => no-op
         index_probe(program, icur, probe, n_cols, on_match, |_p| Ok(()))?;
+
+        program.preassign_label_to_next_insn(skip_probe);
     } else {
         // Table scan fallback
         table_scan_match_any(
@@ -677,6 +737,7 @@ fn emit_fk_parent_key_probe(
             parent_key_start,
             None,
             database_id,
+            resolver,
             on_match,
         )?;
     }
@@ -1068,6 +1129,14 @@ fn emit_fk_delete_parent_existence_check_single(
     };
 
     if let Some(ref idx) = child_idx {
+        let skip_check = program.allocate_label();
+        for i in 0..ncols {
+            program.emit_insn(Insn::IsNull {
+                reg: parent_key_start + i,
+                target_pc: skip_check,
+            });
+        }
+
         let icur = open_read_index(program, idx, database_id);
         let probe = copy_with_affinity(program, parent_key_start, ncols, idx, &fk_ref.child_table);
         index_probe(
@@ -1081,6 +1150,8 @@ fn emit_fk_delete_parent_existence_check_single(
             },
             |_p| Ok(()),
         )?;
+
+        program.preassign_label_to_next_insn(skip_check);
     } else {
         table_scan_match_any(
             program,
@@ -1093,6 +1164,7 @@ fn emit_fk_delete_parent_existence_check_single(
                 None
             },
             database_id,
+            resolver,
             |p| {
                 emit_violation(p)?;
                 Ok(())
@@ -2139,65 +2211,22 @@ pub fn emit_fk_drop_table_check(
             resolver,
         )?;
 
-        // Scan child table for matching rows
-        let child_cur = open_read_table(program, child_tbl, database_id);
-        let child_done = program.allocate_label();
-
-        program.emit_insn(Insn::Rewind {
-            cursor_id: child_cur,
-            pc_if_empty: child_done,
-        });
-
-        let child_loop = program.allocate_label();
-        program.preassign_label_to_next_insn(child_loop);
-        let child_next = program.allocate_label();
-
-        // Compare each FK column to corresponding parent key column
-        // All columns must match for a violation
-        for (i, cname) in child_cols.iter().enumerate() {
-            let (pos, _) = child_tbl
-                .get_column(cname)
-                .ok_or_else(|| LimboError::InternalError(format!("child col {cname} missing")))?;
-
-            let child_val_reg = program.alloc_register();
-            program.emit_insn(Insn::Column {
-                cursor_id: child_cur,
-                column: pos,
-                dest: child_val_reg,
-                default: None,
-            });
-            // If child FK column is NULL, skip (no reference)
-            program.emit_insn(Insn::IsNull {
-                reg: child_val_reg,
-                target_pc: child_next,
-            });
-
-            // Compare child FK column to corresponding parent key column
-            program.emit_insn(Insn::Ne {
-                lhs: child_val_reg,
-                rhs: parent_key_start + i,
-                target_pc: child_next,
-                flags: CmpInsFlags::default().jump_if_null(),
-                collation: Some(CollationSeq::Binary),
-            });
-        }
-
-        // If we reach here, all FK columns match: increment violation counter
-        program.emit_insn(Insn::FkCounter {
-            increment_value: 1,
-            deferred: false,
-        });
-
-        program.preassign_label_to_next_insn(child_next);
-        program.emit_insn(Insn::Next {
-            cursor_id: child_cur,
-            pc_if_next: child_loop,
-        });
-
-        program.preassign_label_to_next_insn(child_done);
-        program.emit_insn(Insn::Close {
-            cursor_id: child_cur,
-        });
+        table_scan_match_any(
+            program,
+            child_tbl,
+            child_cols,
+            parent_key_start,
+            None,
+            database_id,
+            resolver,
+            |p| {
+                p.emit_insn(Insn::FkCounter {
+                    increment_value: 1,
+                    deferred: false,
+                });
+                Ok(())
+            },
+        )?;
     }
 
     // Note: SQLite deletes the parent row here, but we skip that since
